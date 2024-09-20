@@ -2,6 +2,10 @@
 
 A pytorch library for continual learning with diffusion models. This library is based on the hugginface diffusers [diffusers](https://github.com/huggingface/diffusers).
 
+<p align="center">
+  <img src ="continual-diffusers.png" >
+</p>
+
 <p align="center"> <a href="https://bharat-runwal.github.io/" target="_blank id="website">Bharat Runwal</a><sup>1</sup>, <a href="https://yilundu.github.io/" target="_blank id="website">Yilun Du</a><sup>2</sup></p>
 <p align="center"><sup>1</sup> Independent Researcher,<sup>2</sup> MIT</p>
 
