@@ -946,12 +946,37 @@ def main():
     data_structure, num_tasks = get_datasets(args)
     current_task = 1
 
-    # TODO: Add the Resuming from checkpoint logic
-    # # Potentially load in the weights and states from a previous save
-   # if args.resume_from_checkpoint:
+
+    if args.resume_from_checkpoint:
+        # Saved checkpoint : checkpoint-{global_step_for_task}-{task_num}-{epoch}
+        path = args.resume_from_checkpoint
+        accelerator.print(f"Resuming from checkpoint {path}")
+        accelerator.load_state(path)
+        
+        
+        global_step = int(path.split("-")[1])
+        current_task  = int(path.split("-")[2])
+        first_epoch = int(path.split("-")[3])
+
+        initial_global_step = global_step
+
   
+    resume_once=False
 
     for task_num in range(current_task, num_tasks + 1):
+        if resume_once:
+            global_step = 0
+            first_epoch = 0
+            initial_global_step = 0
+        else:
+            if not args.resume_from_checkpoint:
+                global_step = 0
+                first_epoch = 0
+                initial_global_step = 0
+            else:
+                resume_once = True
+
+
         # Load the dataset for the current task
         if task_num == 1:
             train_dataset = preprocess_and_get_hf_dataset_curr_task(
@@ -1067,9 +1092,6 @@ def main():
             f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}"
         )
         logger.info(f"  Total optimization steps = {args.max_train_steps}")
-        global_step = 0
-        first_epoch = 0
-        initial_global_step = 0
 
         logger.info(
             f" Starting with : Task: {task_num} ,first_epoch: {first_epoch}, global_step: {global_step}"

@@ -6,12 +6,14 @@ import numpy as np
 import torch as th
 from PIL import Image
 from torch.utils.data import Dataset
-from torchvision import transforms
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
+def sanity_check(labels):
+    return np.squeeze(labels)
 
 class ContinualDataset(Dataset):
     def __init__(self, uncond_p=0.05, data_structure=None, transform=None):
@@ -109,6 +111,21 @@ def get_dataset(args, transform=None):
             data_structure = pickle.loads(data["data_structure"].item())
             total_tasks = len(data_structure)
 
+            dataset_stats = {}
+            for task_num in data_structure:
+                # Check if 'labels' key is present in the task dictionary
+                if 'labels' in data_structure[task_num]:
+                    data_structure[task_num]['labels'] = sanity_check(data_structure[task_num]['labels'])
+                    dataset_stats[task_num] = {
+                        "images": data_structure[task_num]['images'].shape,
+                        "labels": data_structure[task_num]['labels'].shape
+                    }
+                else:
+                    dataset_stats[task_num] = {
+                        "images": data_structure[task_num]['images'].shape,
+                    }
+
+            logger.info(f"Dataset Statistics: {dataset_stats}")
             # Initialize the dataset with the retrieved structure
             dataset = ContinualDataset(
                 uncond_p=args.uncond_p,

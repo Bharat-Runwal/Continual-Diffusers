@@ -721,11 +721,21 @@ def main(args):
     # Define current task
     current_task = 1
 
-    # TODO : Loading from the past checkoint and upading the current_task
-    # # Potentially load in the weights and states from a previous save
-    # if args.resume_from_checkpoint:
+    if args.resume_from_checkpoint:
+        # Saved checkpoint : checkpoint-{global_step_for_task}-{task_num}-{epoch}
+        path = args.resume_from_checkpoint
+        accelerator.print(f"Resuming from checkpoint {path}")
+        accelerator.load_state(path)
+        
+        
+        global_step = int(path.split("-")[1])
+        current_task  = int(path.split("-")[2])
+        first_epoch = int(path.split("-")[3])
 
-    resume_step = None
+        resume_step = global_step
+    else:
+        resume_step = None
+
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
@@ -753,10 +763,18 @@ def main(args):
         fisher_matrices[1] = None
         previous_parameters[1] = None
 
+    resume_once = False
+
     for task_num in range(current_task, num_tasks + 1):
-        if not args.resume_from_checkpoint:  # TODO : REVISITI THSI LOGIC
+        if resume_once:
             global_step = 0
             first_epoch = 0
+        else:
+            if not args.resume_from_checkpoint: 
+                global_step = 0
+                first_epoch = 0
+            else:
+                resume_once = True
 
         # Set the current task
         logger.info(
