@@ -47,9 +47,9 @@ from tqdm.auto import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer
 from transformers.utils import ContextManagers
 
-from models.unets import Energy_Unet2DConditional
-from samplers.mcmc_samplers import get_mcmc_sampler
-from samplers.sd_pipeline import (Compose_MCMC_StableDiffusionPipeline,
+from continual_diffusers.models.unets import Energy_Unet2DConditional
+from continual_diffusers.samplers.mcmc_samplers import get_mcmc_sampler
+from continual_diffusers.samplers.sd_pipeline import (Compose_MCMC_StableDiffusionPipeline,
                                   Custom_StableDiffusionPipeline)
 
 if is_wandb_available():

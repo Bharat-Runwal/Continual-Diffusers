@@ -21,10 +21,10 @@ from diffusers.utils import (check_min_version, is_accelerate_version,
 from diffusers.utils.import_utils import is_xformers_available
 from packaging import version
 
-from models import CFGUNet2DModel, Energy_CFGUNet2DModel, Energy_UNet2DModel
-from samplers import get_mcmc_sampler
-from samplers.ddpm_pipeline import Compose_DDPMPipeline, Custom_DDPMPipeline
-from samplers.energy_pipeline import Energy_DDPMPipeline
+from continual_diffusers.models import CFGUNet2DModel, Energy_CFGUNet2DModel, Energy_UNet2DModel
+from continual_diffusers.samplers import get_mcmc_sampler
+from continual_diffusers.samplers.ddpm_pipeline import Compose_DDPMPipeline, Custom_DDPMPipeline
+from continual_diffusers.samplers.energy_pipeline import Energy_DDPMPipeline
 
 
 from safetensors.torch import load_file
