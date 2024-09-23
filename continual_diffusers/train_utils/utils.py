@@ -1,7 +1,7 @@
 import torch
 import torch.nn.functional as F
 
-from train_utils.base_steps import base_train_step, base_train_step_energy
+from continual_diffusers.train_utils.base_steps import base_train_step, base_train_step_energy
 import torch.nn as nn
 
 # calculate gradient norm given parameters

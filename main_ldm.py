@@ -55,12 +55,12 @@ from tqdm.auto import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer
 from transformers.utils import ContextManagers
 
-from dataset.dataset_ldm import (get_datasets,
+from continual_diffusers.dataset.dataset_ldm import (get_datasets,
                                  preprocess_and_get_hf_dataset_curr_task)
-from models.unets import Energy_Unet2DConditional
-from replay.buffer import BufferReplay
-from train_utils.train_ldm import train_one_epoch_ldm
-from samplers.sd_pipeline import Energy_StableDiffusionPipeline
+from continual_diffusers.models.unets import Energy_Unet2DConditional
+from continual_diffusers.replay.buffer import BufferReplay
+from continual_diffusers.train_utils.train_ldm import train_one_epoch_ldm
+from continual_diffusers.samplers.sd_pipeline import Energy_StableDiffusionPipeline
 
 if is_wandb_available():
     import wandb

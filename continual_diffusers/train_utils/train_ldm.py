@@ -13,7 +13,7 @@ from diffusers.utils import is_wandb_available
 
 from tqdm import tqdm
 
-from samplers.sd_pipeline import Energy_StableDiffusionPipeline
+from continual_diffusers.samplers.sd_pipeline import Energy_StableDiffusionPipeline
 
 from .base_steps import base_train_step_ldm, base_train_step_ldm_energy
 from .utils import calculate_grad_norm

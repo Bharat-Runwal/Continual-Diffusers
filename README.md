@@ -21,15 +21,16 @@ A pytorch library for continual learning with diffusion models. This library is 
 
 Comming Soon:
 - **LoRA**: Support for LoRA finetuning with Latent Diffusion Models.
+- **Slot Attention**: Conditioning with a slot attention module for training diffusion models.
 ---
 
 ## Setting up the environment
 ```
-conda create -n diffusers python=3.8
-conda activate diffusers
-pip install -r requirements.txt
+conda create -n continual-diffusers python=3.8
+conda activate continual-diffusers
+pip install -e .
 ```
-
+For setting up `bitsandbytes`,  please follow the official installation instructions provided [here](https://huggingface.co/docs/bitsandbytes/main/en/installation).
 
 ## Supported Training Strategies
 
@@ -38,7 +39,7 @@ pip install -r requirements.txt
 | DDPM Unet   | ✔️                      |✔️                    | `class-conditional`, `unconditional`                   |
 | Latent Diffusion Model   | ✔️                     | ✔️                    | `text`   |
 
-**Note**: The Energy-Based and Score-Based Training both supports Classifier-Free Guidance. 
+**Note**: The Energy-Based and Score-Based Training both supports `Classifier-Free Guidance`. 
 
 
 ## Supported Techniques for continual-learning
@@ -81,8 +82,9 @@ We support training the unet model from scratch and finetuning from a pretrained
 bash scripts/train_latent_diffusion_score.sh
 ```
 
-#### Energy-Based Training : **Coming Soon**        
+#### Energy-Based Training : 
 
+We experimented with fine-tuning the pretrained U-Net from the Stable Diffusion checkpoint using energy-based training. However, the results were not satisfactory, so we currently do not provide a dedicated script for energy-based training of Latent Diffusion Models (LDMs). That said, if you wish to explore this further, the framework allows you to train the U-Net either from a pretrained checkpoint or from scratch using the `--unet_scratch` argument in `main_ldm.py` with different energy score type supported.
        
 
 
