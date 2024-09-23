@@ -23,13 +23,13 @@ from packaging import version
 from torchvision import transforms
 from tqdm.auto import tqdm
 
-from dataset import get_dataset
-from models import CFGUNet2DModel, Energy_CFGUNet2DModel, Energy_UNet2DModel
-from replay.buffer import BufferReplay
-from samplers.ddpm_pipeline import Custom_DDPMPipeline
-from samplers.energy_pipeline import Energy_DDPMPipeline
-from train_utils import train_one_epoch
-from train_utils.utils import (calculate_fisher_information,
+from continual_diffusers.dataset import get_dataset
+from continual_diffusers.models import CFGUNet2DModel, Energy_CFGUNet2DModel, Energy_UNet2DModel
+from continual_diffusers.replay.buffer import BufferReplay
+from continual_diffusers.samplers.ddpm_pipeline import Custom_DDPMPipeline
+from continual_diffusers.samplers.energy_pipeline import Energy_DDPMPipeline
+from continual_diffusers.train_utils import train_one_epoch
+from continual_diffusers.train_utils.utils import (calculate_fisher_information,
                                get_model_parameters,initialize_except_conv_out)
 
 
