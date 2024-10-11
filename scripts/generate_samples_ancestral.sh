@@ -31,7 +31,7 @@ python eval.py \
                 --guidance_scale 5 \
                 --resolution 32 \
                 --ddpm_num_inference_steps 1000 \
-                --energy_based_inference \
+                --energy_based_training \
                 --energy_score_type dae \
                 --output_dir /cgm_logs/evals_c10_DAE_cosine \
                 --cache_dir /cgm_logs/cache \

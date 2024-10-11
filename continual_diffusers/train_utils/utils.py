@@ -1,8 +1,111 @@
 import torch
-import torch.nn.functional as F
+from accelerate.logging import get_logger
 
 from continual_diffusers.train_utils.base_steps import base_train_step, base_train_step_energy
 import torch.nn as nn
+from continual_diffusers.dataset.dataset_ldm import preprocess_and_get_hf_dataset_curr_task
+
+logger = get_logger(__name__, log_level="INFO")
+
+
+def collate_fn(examples):
+    pixel_values = torch.stack(
+        [example["images"] for example in examples]
+    )
+    pixel_values = pixel_values.to(
+        memory_format=torch.contiguous_format
+    ).float()
+    input_ids = torch.stack([example["input_ids"] for example in examples])
+    return {"images": pixel_values, "input_ids": input_ids}
+
+
+def get_task_dataloader(
+    task_num, args, accelerator, replay=None,train_transform=None ,data_structure= None, dataset=None,tokenizer=None
+):
+    """
+    Get the dataloader for the current task
+
+    Args:
+        task_num: The current task number
+        data_structure: Dictionary containing the data for all tasks
+        tokenizer: The tokenizer to be used
+        args: Additional arguments
+        accelerator: Accelerator for distributed training
+        replay: Optional replay buffer
+        train_transform: The training transform to be used
+
+    Returns:
+        train_dataloader: The dataloader for the current task
+    """
+    
+    # Set the current task with buffer, for the first task no buffer is added
+    if task_num == 1:
+        if args.text_conditioning:
+            dataset = preprocess_and_get_hf_dataset_curr_task(
+                data_structure,
+                task_num,
+                tokenizer,
+                args,
+                accelerator,
+                args.caption_column,
+                args.image_column,
+                replay=None,        # No replay for the first task
+                train_transform=train_transform
+            )
+            # DataLoaders creation:
+            train_dataloader = torch.utils.data.DataLoader(
+                dataset,
+                shuffle=True,
+                collate_fn=collate_fn,
+                batch_size=args.train_batch_size,
+                num_workers=args.dataloader_num_workers,
+            ) 
+        else:
+            dataset.set_current_task(task_num, buffer=None)
+            # Get the dataloader
+            train_dataloader = torch.utils.data.DataLoader(
+                dataset,
+                batch_size=args.train_batch_size,
+                shuffle=True,
+                num_workers=args.dataloader_num_workers,
+            )
+
+    else:
+        if args.text_conditioning:
+            dataset = preprocess_and_get_hf_dataset_curr_task(
+                data_structure,
+                task_num,
+                tokenizer,
+                args,
+                accelerator,
+                args.caption_column,
+                args.image_column,
+                replay=replay,
+                train_transform=train_transform
+            )
+            # DataLoaders creation:
+            train_dataloader = torch.utils.data.DataLoader(
+                dataset,
+                shuffle=True,
+                collate_fn=collate_fn,
+                batch_size=args.train_batch_size,
+                num_workers=args.dataloader_num_workers,
+            ) 
+        else:
+            dataset.set_current_task(task_num, buffer=replay)
+            # Get the dataloader
+            train_dataloader = torch.utils.data.DataLoader(
+                dataset,
+                batch_size=args.train_batch_size,
+                shuffle=True,
+                num_workers=args.dataloader_num_workers,
+            )
+    logger.info(f"Task: {task_num} - Dataset size: {len(dataset)}")
+
+    return train_dataloader
+
+
+
 
 # calculate gradient norm given parameters
 def calculate_grad_norm(parameters):

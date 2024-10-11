@@ -1185,14 +1185,3 @@ class Energy_Unet2DConditional(UNet2DConditionModel):
             return (sample,)
 
         return UNet2DConditionOutput(sample=sample)
-
-
-# Example usage
-# model = Energy_Unet2DConditional(sample_size=(64, 64), num_class_embeds=10)
-# sample = torch.randn(2, 3, 64, 64)
-# timestep = 1
-# class_labels = torch.randint(0, 10, (2,))
-# print(class_labels.shape)  # torch.Size([2]])
-# mask = torch.randint(0, 2, (2,), dtype=torch.bool)  # Generate boolean mask directly
-# output = model(sample, timestep, class_labels, mask=mask)
-# print(output.sample.shape)  # torch.Size([2, 3, 64, 64])

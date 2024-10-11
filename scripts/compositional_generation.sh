@@ -22,7 +22,7 @@ python eval.py \
                 --classifier_free_guidance \
                 --project_name continual-diffusers \
                 --run_name Compose_score_DDPM_DAE_UHA \
-                --energy_based_inference \
+                --energy_based_training \
                 --composition_pipeline \
                 --composition_labels "2,3" \
                 --mcmc_sampler UHA \

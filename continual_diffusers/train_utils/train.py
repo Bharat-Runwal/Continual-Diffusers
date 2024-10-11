@@ -7,7 +7,7 @@ from accelerate.logging import get_logger
 from diffusers.models.unets import unet_2d
 from tqdm import tqdm
 
-from .base_steps import (base_train_step, base_train_step_energy,
+from .base_steps import (base_train_step, base_train_step_energy,base_train_step_ldm,base_train_step_ldm_energy,
                          calculate_ewc_loss)
 from .utils import calculate_grad_norm
 
@@ -32,13 +32,22 @@ def train_one_epoch(
     task_num,
     fisher_matrix=None,
     previous_parameters=None,
+    text_encoder=None,
+    uncond_token_ids=None,
 ):
     """Train the model for one epoch."""
 
-    if args.energy_based_training:
-        train_step = base_train_step_energy
+    if args.text_conditioning:
+        assert text_encoder is not None, "Text encoder must be provided for text conditioning."
+        if args.energy_based_training:
+            train_step = base_train_step_ldm_energy
+        else:
+            train_step = base_train_step_ldm
     else:
-        train_step = base_train_step
+        if args.energy_based_training:
+            train_step = base_train_step_energy
+        else:
+            train_step = base_train_step
 
     if args.ewc_loss:
         ewc_loss = None
@@ -57,6 +66,7 @@ def train_one_epoch(
 
         clean_images = batch["images"].to(weight_dtype)
 
+
         # Sample noise that we'll add to the images
         noise = torch.randn(
             clean_images.shape, dtype=weight_dtype, device=clean_images.device
@@ -74,23 +84,46 @@ def train_one_epoch(
         # (this is the forward diffusion process)
         noisy_images = noise_scheduler.add_noise(clean_images, noise, timesteps)
 
+        if text_encoder is not None:
+            input_ids_text = batch["input_ids"]
+            if args.classifier_free_guidance:
+                # Randomly replace uncond_prob of the input_ids with empty token id
+                uncond_token_ids = uncond_token_ids.to(input_ids_text.device)
+                empty_tokens = uncond_token_ids.repeat(input_ids_text.shape[0], 1)  # Shape: [batch_size, 77] (For CLIP)
+                mask = torch.rand(input_ids_text.shape[0]) < args.uncond_p
+                
+                input_ids_text[mask] = empty_tokens[mask]
+                
+            # Get the text embedding for conditioning
+            encoder_hidden_states = text_encoder(input_ids_text, return_dict=False)[
+                0
+            ]
+
         with accelerator.accumulate(model):
             # Predict the noise residual and returns the loss
             if args.energy_based_training:
                 loss, energy_norm = train_step(
-                    model, noisy_images, timesteps, noise, batch, weight_dtype, args
+                    model,
+                    noise_scheduler,
+                    timesteps,
+                    noise,
+                    noisy_images,
+                    clean_images,
+                    batch if not args.text_conditioning else noise,
+                    encoder_hidden_states if args.text_conditioning else None,
+                    args
                 )
             else:
                 loss = train_step(
                     model,
-                    noisy_images,
-                    timesteps,
                     noise_scheduler,
+                    timesteps,
                     noise,
+                    noisy_images,
                     clean_images,
-                    batch,
-                    weight_dtype,
-                    args,
+                    batch if not args.text_conditioning else noise,
+                    encoder_hidden_states if args.text_conditioning else None,
+                    args
                 )
 
             if (

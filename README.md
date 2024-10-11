@@ -36,7 +36,7 @@ For setting up `bitsandbytes`,  please follow the official installation instruct
 
 | Model Type         | Energy-Based Training | Score-Based Training | Conditioning                      |
 |--------------------|-----------------------|----------------------|-----------------------------------|
-| DDPM Unet   | ✔️                      |✔️                    | `class-conditional`, `unconditional`                   |
+| DDPM Unet   | ✔️                      |✔️                    |`Text`, `class-conditional`, `unconditional`                   |
 | Latent Diffusion Model   | ✔️                     | ✔️                    | `text`   |
 
 **Note**: The Energy-Based and Score-Based Training both supports `Classifier-Free Guidance`. 
@@ -61,7 +61,7 @@ We mainly support following techniques for continual learning with diffusion mod
 The following commands trains a DDPM model with score-based appraoch Please refer to the `scripts/train_ddpm_score.sh` for more details.
  
 ```
-bash scripts/train_ddpm.sh
+bash scripts/train_ddpm_score.sh
 ```
 
 ### Energy-Based Training
@@ -70,6 +70,8 @@ Please refer to the `scripts/train_ddpm_energy.sh` for more details.
 ```
 bash scripts/train_ddpm_energy.sh
 ```
+
+**Note :** For `text` based conditioning, please refer to the script `scripts/train_clip_cond.sh` for more details.
 
 
 ### Training Latent Diffusion Model

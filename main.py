@@ -11,8 +11,10 @@ import diffusers
 import torch
 from accelerate import Accelerator, InitProcessGroupKwargs
 from accelerate.logging import get_logger
+from accelerate.state import AcceleratorState
+
 from accelerate.utils import ProjectConfiguration, set_seed
-from diffusers import DDPMScheduler, UNet2DModel
+from diffusers import DDPMScheduler
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel
 from diffusers.utils import (check_min_version, is_accelerate_version,
@@ -22,18 +24,35 @@ from huggingface_hub import create_repo, upload_folder
 from packaging import version
 from torchvision import transforms
 from tqdm.auto import tqdm
+from transformers import CLIPTextModel, CLIPTokenizer
+from transformers.utils import ContextManagers
 
 from continual_diffusers.dataset import get_dataset
-from continual_diffusers.models import CFGUNet2DModel, Energy_CFGUNet2DModel, Energy_UNet2DModel
+from continual_diffusers.dataset.dataset_ldm import get_datasets_ldm ,get_tokenized_text
+from continual_diffusers.models.utils import load_model
 from continual_diffusers.replay.buffer import BufferReplay
-from continual_diffusers.samplers.ddpm_pipeline import Custom_DDPMPipeline
-from continual_diffusers.samplers.energy_pipeline import Energy_DDPMPipeline
+from continual_diffusers.samplers.ddpm_pipeline import Custom_DDPMPipeline, Custom_Text_DDPMPipeline
+from continual_diffusers.samplers.energy_pipeline import Energy_DDPMPipeline, Energy_Text_DDPMPipeline
 from continual_diffusers.train_utils import train_one_epoch
 from continual_diffusers.train_utils.utils import (calculate_fisher_information,
-                               get_model_parameters,initialize_except_conv_out)
+                               get_model_parameters, get_task_dataloader)
 
 
 logger = get_logger(__name__, log_level="INFO")
+
+def deepspeed_zero_init_disabled_context_manager():
+    """
+    returns either a context list that includes one that will disable zero.Init or an empty context list
+    """
+    deepspeed_plugin = (
+        AcceleratorState().deepspeed_plugin
+        if accelerate.state.is_initialized()
+        else None
+    )
+    if deepspeed_plugin is None:
+        return []
+
+    return [deepspeed_plugin.zero3_init_context_manager(enable=False)]
 
 
 def parse_args():
@@ -110,6 +129,14 @@ def parse_args():
         type=int,
         default=10,
         help="How often to save images during training.",
+    )
+    parser.add_argument(
+        "--dream_training",
+        action="store_true",
+        help=(
+            "Use the DREAM training method, which makes training more efficient and accurate at the ",
+            "expense of doing an extra forward pass. See: https://arxiv.org/abs/2312.00210",
+        ),
     )
     parser.add_argument(
         "--save_model_epochs",
@@ -262,7 +289,7 @@ def parse_args():
     parser.add_argument(
         "--checkpointing_steps",
         type=int,
-        default=50,
+        default=10,
         help=(
             "Save a checkpoint of the training state every X updates. These checkpoints are only suitable for resuming"
             " training using `--resume_from_checkpoint`."
@@ -416,7 +443,68 @@ def parse_args():
         default=42,
         help="Random seed that will be set in the training script.",
     )
+    parser.add_argument(
+        "--text_conditioning",
+        action="store_true",
+        help="Whether to condition the replay buffer on text.",
+    )
 
+    parser.add_argument(
+        "--clip_text_pretrained_path",
+        type=str,
+        default=None,
+        help="Path to pretrained model or model identifier from huggingface.co/models.",
+    )
+    parser.add_argument(
+        "--revision",
+        type=str,
+        default=None,
+        required=False,
+        help="Revision of pretrained model identifier from huggingface.co/models.",
+    )
+    parser.add_argument(
+        "--variant",
+        type=str,
+        default=None,
+        help="Variant of the model files of the pretrained model identifier from huggingface.co/models, 'e.g.' fp16",
+    )
+    parser.add_argument(
+        "--image_column",
+        type=str,
+        default="images",
+        help="The column of the dataset containing an image.",
+    )
+    parser.add_argument(
+        "--caption_column",
+        type=str,
+        default="labels",
+        help="The column of the dataset containing a caption or a list of captions.",
+    )
+    parser.add_argument(
+        "--max_train_samples",
+        type=int,
+        default=None,
+        help=(
+            "For debugging purposes or quicker training, truncate the number of training examples to this "
+            "value if set."
+        ),
+    )
+    parser.add_argument(
+        "--snr_gamma",
+        type=float,
+        default=None,
+        help="SNR weighting gamma to be used if rebalancing the loss. Recommended value is 5.0. "
+        "More details here: https://arxiv.org/abs/2303.09556.",
+    )
+    parser.add_argument(
+        "--validation_prompts",
+        type=str,
+        default=None,
+        nargs="+",
+        help=(
+            "A set of prompts evaluated every `--validation_epochs` and logged to `--report_to`."
+        ),
+    )
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
@@ -428,6 +516,7 @@ def parse_args():
         )
 
     return args
+
 
 
 def main(args):
@@ -460,6 +549,12 @@ def main(args):
             )
         import wandb
 
+
+
+    
+    # Load the model    
+    model,model_cls = load_model(args)    
+
     # `accelerate` 0.16.0 will have better support for customized saving
     if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
         # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
@@ -478,25 +573,12 @@ def main(args):
             if args.use_ema:
                 load_model = EMAModel.from_pretrained(
                     os.path.join(input_dir, "unet_ema"),
-                    UNet2DModel,
-                    CFGUNet2DModel,
-                    Energy_UNet2DModel,
-                    Energy_CFGUNet2DModel,
+                    model_cls   
                 )
                 ema_model.load_state_dict(load_model.state_dict())
                 ema_model.to(accelerator.device)
                 del load_model
 
-            if args.classifier_free_guidance:
-                if args.energy_based_training:
-                    model_cls = Energy_CFGUNet2DModel
-                else:
-                    model_cls = CFGUNet2DModel
-            else:
-                if args.energy_based_training:
-                    model_cls = Energy_UNet2DModel
-                else:
-                    model_cls = UNet2DModel
 
             for i in range(len(models)):
                 # pop models so that they are not loaded again
@@ -542,85 +624,28 @@ def main(args):
                 token=args.hub_token,
             ).repo_id
 
-    if args.classifier_free_guidance:
-        if args.energy_based_training:
-            model_cls = Energy_CFGUNet2DModel
-        else:
-            model_cls = CFGUNet2DModel
+    if args.text_conditioning:
+        with ContextManagers(deepspeed_zero_init_disabled_context_manager()):
+            text_encoder = CLIPTextModel.from_pretrained(
+                args.clip_text_pretrained_path,
+                subfolder="text_encoder",
+                revision=args.revision,
+                variant=args.variant,
+                cache_dir=args.cache_dir,
+            )
+        tokenizer = CLIPTokenizer.from_pretrained(
+        args.clip_text_pretrained_path,
+        subfolder="tokenizer",
+        revision=args.revision,
+    )
+        # Freeze the text encoder
+        text_encoder.requires_grad_(False)
+        if args.classifier_free_guidance:
+            uncond_tokens = get_tokenized_text([""], tokenizer).input_ids
     else:
-        if args.energy_based_training:
-            model_cls = Energy_UNet2DModel
-        else:
-            model_cls = UNet2DModel
+        text_encoder = None
+        tokenizer = None
 
-    # Initialize the model
-    if args.model_config_name_or_path is None:
-        if args.energy_based_training:
-            model = model_cls(
-                sample_size=args.resolution,
-                in_channels=3,
-                num_class_embeds=(
-                    args.num_class_labels if args.num_class_labels else None
-                ),
-                out_channels=(
-                    3
-                    if args.variance_type in ["fixed_small", "fixed_small_log"]
-                    else 3 * 2
-                ),
-                layers_per_block=2,
-                block_out_channels=(128, 128, 256, 256, 512, 512),
-                down_block_types=(
-                    "DownBlock2D",
-                    "DownBlock2D",
-                    "DownBlock2D",
-                    "DownBlock2D",
-                    "AttnDownBlock2D",
-                    "DownBlock2D",
-                ),
-                up_block_types=(
-                    "UpBlock2D",
-                    "AttnUpBlock2D",
-                    "UpBlock2D",
-                    "UpBlock2D",
-                    "UpBlock2D",
-                    "UpBlock2D",
-                ),
-                energy_score_type=args.energy_score_type,
-            )
-        else:
-            model = model_cls(
-                sample_size=args.resolution,
-                in_channels=3,
-                num_class_embeds=(
-                    args.num_class_labels if args.num_class_labels else None
-                ),
-                out_channels=(
-                    3
-                    if args.variance_type in ["fixed_small", "fixed_small_log"]
-                    else 3 * 2
-                ),
-                layers_per_block=2,
-                block_out_channels=(128, 128, 256, 256, 512, 512),
-                down_block_types=(
-                    "DownBlock2D",
-                    "DownBlock2D",
-                    "DownBlock2D",
-                    "DownBlock2D",
-                    "AttnDownBlock2D",
-                    "DownBlock2D",
-                ),
-                up_block_types=(
-                    "UpBlock2D",
-                    "AttnUpBlock2D",
-                    "UpBlock2D",
-                    "UpBlock2D",
-                    "UpBlock2D",
-                    "UpBlock2D",
-                ),
-            )
-    else:
-        config = model_cls.load_config(args.model_config_name_or_path)
-        model = model_cls.from_config(config)
 
     # if args.energy_based_training:
     #     # Zero initialize all conv layers except the conv_out layer
@@ -694,33 +719,63 @@ def main(args):
     )
 
     # Preprocessing the datasets and DataLoaders creation.
+    # transform = transforms.Compose(
+    #     [
+    #         transforms.ToTensor(),
+    #         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+    #     ]
+    # )
 
+    # Preprocessing the datasets.
     transform = transforms.Compose(
         [
+            transforms.Resize(
+                args.resolution, interpolation=transforms.InterpolationMode.BILINEAR
+            ),
+            (
+                transforms.CenterCrop(args.resolution)
+                if args.center_crop
+                else transforms.RandomCrop(args.resolution)
+            ),
+            (
+                transforms.RandomHorizontalFlip()
+                if args.random_flip
+                else transforms.Lambda(lambda x: x)
+            ),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+            transforms.Normalize([0.5], [0.5]),
         ]
     )
-    # Prepare everything with our `accelerator`.
 
+    # Prepare everything with our `accelerator`.
     (
         model,
         optimizer,
     ) = accelerator.prepare(model, optimizer)
 
+    if args.text_conditioning:
+        # Move text_encode to gpu and cast to weight_dtype
+        text_encoder.to(accelerator.device, dtype=weight_dtype)
+
     if args.use_ema:
         ema_model.to(accelerator.device)
-
-    dataset, num_tasks = get_dataset(args, transform)
-
-    logger.info(f"Number of tasks for the dataset {args.dataset_name}: {num_tasks}")
 
     # Load the Replay Mechanism
     replay = BufferReplay(args, device=accelerator.device)
 
+    if args.text_conditioning:
+        data_structure, num_tasks = get_datasets_ldm(args)
+    else:
+        dataset, num_tasks = get_dataset(args, transform)
+
+    logger.info(f"Number of tasks for the dataset {args.dataset_name}: {num_tasks}")
+
+
     # Define current task
     current_task = 1
 
+    # TODO : Loading from the past checkoint and upading the current_task
+    # # Potentially load in the weights and states from a previous save
     if args.resume_from_checkpoint:
         # Saved checkpoint : checkpoint-{global_step_for_task}-{task_num}-{epoch}
         path = args.resume_from_checkpoint
@@ -764,7 +819,6 @@ def main(args):
         previous_parameters[1] = None
 
     resume_once = False
-
     for task_num in range(current_task, num_tasks + 1):
         if resume_once:
             global_step = 0
@@ -773,29 +827,28 @@ def main(args):
             if not args.resume_from_checkpoint: 
                 global_step = 0
                 first_epoch = 0
-            else:
+            elif args.resume_from_checkpoint:
                 resume_once = True
+
+
 
         # Set the current task
         logger.info(
             f" Starting with : Task: {task_num} ,first_epoch: {first_epoch}, global_step: {global_step}"
         )
 
-        # Set the current task with buffer, for the first task no buffer is added
-        if task_num == 1:
-            dataset.set_current_task(task_num, buffer=None)
+
+        # Get current task dataloder 
+        if args.text_conditioning:
+            train_dataloader = get_task_dataloader(
+                task_num, args, accelerator, replay=replay,train_transform=transform,data_structure=data_structure,tokenizer=tokenizer
+            )
         else:
-            dataset.set_current_task(task_num, buffer=replay)
+            train_dataloader = get_task_dataloader(
+                task_num, args, accelerator, replay=replay,train_transform=transform, dataset= dataset,
+            )
 
-        logger.info(f"Task: {task_num} - Dataset size: {len(dataset)}")
 
-        # Get the dataloader
-        train_dataloader = torch.utils.data.DataLoader(
-            dataset,
-            batch_size=args.train_batch_size,
-            shuffle=True,
-            num_workers=args.dataloader_num_workers,
-        )
 
         # Initialize the learning rate scheduler
         lr_scheduler = get_scheduler(
@@ -818,10 +871,8 @@ def main(args):
         num_update_steps_per_epoch = math.ceil(
             len(train_dataloader) / args.gradient_accumulation_steps
         )
-        max_train_steps = args.num_epochs * num_update_steps_per_epoch
 
         logger.info("***** Running training *****")
-        logger.info(f"  Num examples = {len(dataset)}")
         logger.info(f"  Num Epochs = {args.num_epochs}")
         logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
         logger.info(
@@ -830,7 +881,6 @@ def main(args):
         logger.info(
             f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}"
         )
-        logger.info(f"  Total optimization steps = {max_train_steps}")
 
         # Train
         for epoch in range(first_epoch, args.num_epochs):
@@ -860,6 +910,8 @@ def main(args):
                     if args.ewc_loss and task_num > 1
                     else None
                 ),
+                text_encoder=text_encoder,
+                uncond_token_ids=uncond_tokens if args.text_conditioning else None,
             )
 
             accelerator.wait_for_everyone()
@@ -873,38 +925,66 @@ def main(args):
                         ema_model.store(unet.parameters())
                         ema_model.copy_to(unet.parameters())
                     if args.energy_based_training:
-                        pipeline = Energy_DDPMPipeline(
-                            unet=unet,
-                            scheduler=noise_scheduler,
-                        )
+                        if args.text_conditioning:
+                            pipeline = Energy_Text_DDPMPipeline(
+                                unet=unet,
+                                scheduler=noise_scheduler,
+                                text_encoder=text_encoder,
+                                tokenizer= tokenizer ,
+
+                            )
+                        else:
+                            pipeline = Energy_DDPMPipeline(
+                                unet=unet,
+                                scheduler=noise_scheduler,
+                            )
                     else:
-                        pipeline = Custom_DDPMPipeline(
-                            unet=unet,
-                            scheduler=noise_scheduler,
-                        )
+                        if args.text_conditioning:
+                            pipeline = Custom_Text_DDPMPipeline(
+                                unet=unet,
+                                scheduler=noise_scheduler,
+                                tokenizer= tokenizer ,
+                                text_encoder=text_encoder,
+                            )
+                        else:
+                            pipeline = Custom_DDPMPipeline(
+                                unet=unet,
+                                scheduler=noise_scheduler,
+                            )
 
                     generator = torch.Generator(device=pipeline.device).manual_seed(args.seed)
                     # run pipeline in inference (sample random noise and denoise)
-
-                    # Get the unique class labels for the task
-                    if args.num_class_labels is not None:
-                        class_labels = dataset.get_class_labels(task_num)
-                        class_labels = torch.tensor(class_labels, dtype=torch.long)
-                        sampled_class_labels = class_labels[
-                            torch.randint(len(class_labels), (args.eval_batch_size,))
-                        ].to(pipeline.device)
+                    if args.text_conditioning:
+                        if args.validation_prompts:
+                            images = pipeline(
+                                prompt=args.validation_prompts,
+                                batch_size= args.eval_batch_size,
+                                generator=  generator,
+                                num_inference_steps=args.ddpm_num_inference_steps,
+                                output_type="np",
+                                classifier_free_guidance=args.classifier_free_guidance,
+                                guidance_scale=args.guidance_scale,
+                            ).images
                     else:
-                        sampled_class_labels = None
+                        # Get the unique class labels for the task
+                        if args.num_class_labels is not None:
+                            class_labels = dataset.get_class_labels(task_num)
+                            class_labels = torch.tensor(class_labels, dtype=torch.long)
+                            sampled_class_labels = class_labels[
+                                torch.randint(len(class_labels), (args.eval_batch_size,))
+                            ].to(pipeline.device)
+                        else:
+                            sampled_class_labels = None
 
-                    images = pipeline(
-                        generator=generator,
-                        batch_size=args.eval_batch_size,
-                        num_inference_steps=args.ddpm_num_inference_steps,
-                        output_type="np",
-                        class_labels=sampled_class_labels,
-                        classifier_free_guidance=args.classifier_free_guidance,
-                        guidance_scale=args.guidance_scale,
-                    ).images
+                        images = pipeline(
+                            generator=generator,
+                            batch_size=args.eval_batch_size,
+                            num_inference_steps=args.ddpm_num_inference_steps,
+                            output_type="np",
+                            class_labels=sampled_class_labels,
+                            classifier_free_guidance=args.classifier_free_guidance,
+                            guidance_scale=args.guidance_scale,
+                        ).images
 
                     if args.use_ema:
                         ema_model.restore(unet.parameters())
@@ -983,7 +1063,10 @@ def main(args):
                 )
                 previous_parameters[task_num] = get_model_parameters(model)
 
-            replay.add_task_data(dataset.task_data[task_num])
+            if args.text_conditioning:
+                replay.add_task_data(data_structure[task_num])
+            else:
+                replay.add_task_data(dataset.task_data[task_num])
 
     accelerator.end_training()
 

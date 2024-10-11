@@ -24,14 +24,14 @@ def _extract_into_tensor(arr, timesteps, broadcast_shape):
 
 def base_train_step(
     model,
-    noisy_images,
-    timesteps,
     noise_scheduler,
+    timesteps,
     noise,
+    noisy_images,
     clean_images,
     batch,
-    weight_dtype,
-    args,
+    encoder_hidden_states,
+    args
 ):
     """
     Calculate the loss for training.
@@ -93,8 +93,17 @@ def base_train_step(
 
 
 def base_train_step_energy(
-    model, noisy_images, timesteps, noise, batch, weight_dtype, args
-):
+    model,
+    noise_scheduler,
+    timesteps,
+    noise,
+    noisy_images,
+    clean_images,
+    batch,
+    encoder_hidden_states,
+    args,
+
+    ):
     """
     Calculate the loss for energy-based diffusion training.
 
@@ -147,8 +156,23 @@ def base_train_step_energy(
                 noisy_images, timesteps, return_dict=False
             )
 
-    # Calculate loss using mean squared error
-    loss = F.mse_loss(model_output, noise)
+
+    if args.prediction_type == "epsilon":
+        loss = F.mse_loss(
+            model_output.float(), noise.float()
+        )  
+    elif args.prediction_type == "sample":
+        alpha_t = _extract_into_tensor(
+            noise_scheduler.alphas_cumprod, timesteps, (clean_images.shape[0], 1, 1, 1)
+        )
+        snr_weights = alpha_t / (1 - alpha_t)
+        # use SNR weighting from distillation paper
+        loss = snr_weights * F.mse_loss(
+            model_output.float(), clean_images.float(), reduction="none"
+        )
+        loss = loss.mean()
+    else:
+        raise ValueError(f"Unsupported prediction type: {args.prediction_type}")
 
     return loss, energy_norm.detach().item()
 
@@ -159,6 +183,7 @@ def base_train_step_ldm(
     timesteps,
     noise,
     noisy_latents,
+    clean_images,
     target,
     encoder_hidden_states,
     args,
@@ -225,6 +250,7 @@ def base_train_step_ldm_energy(
     timesteps,
     noise,
     noisy_latents,
+    clean_images,
     target,
     encoder_hidden_states,
     args,
@@ -268,7 +294,6 @@ def base_train_step_ldm_energy(
         model_pred, energy_norm = unet(
             noisy_latents, timesteps, encoder_hidden_states, return_dict=False
         )
-
 
     if args.snr_gamma is None:
         loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")

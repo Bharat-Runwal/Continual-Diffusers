@@ -21,15 +21,32 @@ from diffusers.utils import (check_min_version, is_accelerate_version,
 from diffusers.utils.import_utils import is_xformers_available
 from packaging import version
 
-from continual_diffusers.models import CFGUNet2DModel, Energy_CFGUNet2DModel, Energy_UNet2DModel
-from continual_diffusers.samplers import get_mcmc_sampler
-from continual_diffusers.samplers.ddpm_pipeline import Compose_DDPMPipeline, Custom_DDPMPipeline
-from continual_diffusers.samplers.energy_pipeline import Energy_DDPMPipeline
+from transformers import CLIPTextModel, CLIPTokenizer
+from transformers.utils import ContextManagers
+from accelerate.state import AcceleratorState
 
+from continual_diffusers.samplers.ddpm_pipeline import Compose_DDPMPipeline, Custom_DDPMPipeline,Custom_Text_DDPMPipeline
+from continual_diffusers.samplers.energy_pipeline import Energy_DDPMPipeline, Energy_Text_DDPMPipeline
 
+from continual_diffusers.models.utils import get_model_class
+from eval_utils import get_grad_fn_mcmc_sampler
 from safetensors.torch import load_file
 
 logger = get_logger(__name__, log_level="INFO")
+
+def deepspeed_zero_init_disabled_context_manager():
+    """
+    returns either a context list that includes one that will disable zero.Init or an empty context list
+    """
+    deepspeed_plugin = (
+        AcceleratorState().deepspeed_plugin
+        if accelerate.state.is_initialized()
+        else None
+    )
+    if deepspeed_plugin is None:
+        return []
+
+    return [deepspeed_plugin.zero3_init_context_manager(enable=False)]
 
 
 def parse_args():
@@ -274,7 +291,7 @@ def parse_args():
         help="Energy guidance scale for Energy based inference for Adjusted Samplers MALA and CHA.",
     )
     parser.add_argument(
-        "--energy_based_inference",
+        "--energy_based_training",
         action="store_true",
         help="Whether to use energy based Inference.",
     )
@@ -352,6 +369,41 @@ def parse_args():
         default=None,
         help="The labels for composition pipeline.",
     )
+    parser.add_argument(
+        "--text_conditioning",
+        action="store_true",
+        help="Whether to condition the replay buffer on text.",
+    )
+
+    parser.add_argument(
+        "--clip_text_pretrained_path",
+        type=str,
+        default=None,
+        required=True,
+        help="Path to pretrained model or model identifier from huggingface.co/models.",
+    )
+    parser.add_argument(
+        "--revision",
+        type=str,
+        default=None,
+        required=False,
+        help="Revision of pretrained model identifier from huggingface.co/models.",
+    )
+    parser.add_argument(
+        "--variant",
+        type=str,
+        default=None,
+        help="Variant of the model files of the pretrained model identifier from huggingface.co/models, 'e.g.' fp16",
+    )
+    parser.add_argument(
+        "--validation_prompts",
+        type=str,
+        default=None,
+        nargs="+",
+        help=(
+            "A set of prompts evaluated every `--validation_epochs` and logged to `--report_to`."
+        ),
+    )
 
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -410,23 +462,31 @@ def main(args):
         if args.output_dir is not None:
             os.makedirs(args.output_dir, exist_ok=True)
 
-
-    if args.classifier_free_guidance:
-        if args.energy_based_inference:
-            model_cls = Energy_CFGUNet2DModel
-        else:
-            model_cls = CFGUNet2DModel
+    if args.text_conditioning:
+        with ContextManagers(deepspeed_zero_init_disabled_context_manager()):
+            text_encoder = CLIPTextModel.from_pretrained(
+                args.clip_text_pretrained_path,
+                subfolder="text_encoder",
+                revision=args.revision,
+                variant=args.variant,
+                cache_dir=args.cache_dir,
+            )
+        tokenizer = CLIPTokenizer.from_pretrained(
+        args.clip_text_pretrained_path,
+        subfolder="tokenizer",
+        revision=args.revision,
+    )
+        # Freeze the text encoder
+        text_encoder.requires_grad_(False)
     else:
-        if args.energy_based_inference:
-            model_cls = Energy_UNet2DModel
-        else:
-            model_cls = UNet2DModel
+        text_encoder = None
+        tokenizer = None
 
-
+    model_cls = get_model_class(args)   
     config = model_cls.load_config(args.model_config_name_or_path)
 
     # update the config with energy_score_type value
-    if args.energy_based_inference:  # TODO: Better way of saving config
+    if args.energy_based_training:  # TODO: Better way of saving config
         config["energy_score_type"] = args.energy_score_type
         config["eval_mode"] = True
 
@@ -475,8 +535,12 @@ def main(args):
                 "xformers is not available. Make sure it is installed correctly"
             )
 
-    # Initialize the scheduler
 
+    if args.text_conditioning:
+        # Move text_encode to gpu and cast to weight_dtype
+        text_encoder.to(accelerator.device, dtype=weight_dtype)
+
+    # Initialize the scheduler
     accepts_prediction_type = "prediction_type" in set(
         inspect.signature(DDPMScheduler.__init__).parameters.keys()
     )
@@ -494,287 +558,9 @@ def main(args):
             variance_type=args.variance_type,
         )
 
+
     if args.mcmc_sampler:
-
-        def gradient(x_t, ts, model, kwargs):
-            # for classifier-free-guidance
-            original_shape = x_t.shape
-            x_t = torch.cat([x_t] * 2)
-            # check if key "mask" exsits in kwargs
-            if "mask" in kwargs:
-                model_output = model(
-                    x_t, ts, mask=kwargs["mask"], class_labels=kwargs["class_labels"]
-                ).sample
-            else:
-                model_output = model(
-                    x_t, ts, class_labels=kwargs["class_labels"]
-                ).sample
-
-
-            # split the output into conditional and unconditional
-            out_size = model_output.size()  # (2*batch_size, channels, height, width)
-            pred_noise = model_output.reshape(
-                2, -1, *out_size[1:]
-            )  # (2, batch_size, channels, height, width)
-            noise_pred_eps_cond, noise_pred_eps_uncond = pred_noise[0], pred_noise[1]
-
-            if model_output.shape[1] == original_shape[1] * 2 and kwargs[
-                "variance_type"
-            ] in ["learned", "learned_range"]:
-                # get eps, variance
-                noise_pred_eps_cond, noise_pred_var_cond = noise_pred_eps_cond.split(
-                    x_t.shape[1], dim=1
-                )  # split the channels eps,var
-                noise_pred_eps_uncond, _ = noise_pred_eps_uncond.split(
-                    x_t.shape[1], dim=1
-                )
-
-            noise_pred = noise_pred_eps_uncond + args.guidance_scale * (
-                noise_pred_eps_cond - noise_pred_eps_uncond
-            )
-
-            if model_output.shape[1] == original_shape[1] * 2 and kwargs[
-                "variance_type"
-            ] in ["learned", "learned_range"]:
-                noise_pred = torch.cat([noise_pred, noise_pred_var_cond], dim=1)
-
-            # Need to scale the gradients by coefficient to properly account for normalization in DSM loss + data contraction
-            # where we have replaced ε_θ(x, t) with -σ_t * ∇_x f_θ(x + σ_t * ε)
-            return -1 * kwargs["scalar"] * noise_pred
-
-        def gradient_compose(x_t, ts, model, kwargs):
-            # for classifier-free-guidance
-            original_shape = x_t.shape
-            x_t = torch.cat([x_t] * 2)
-
-            # check if key "mask" exsits in kwargs
-            if "mask" in kwargs:
-                mask = kwargs["mask"]
-                labels = kwargs["class_labels"]
-
-                model_output = []
-                for label_, mask_ in zip(labels, mask):
-                    model_output.append(
-                        model(
-                            x_t[:1],
-                            ts,
-                            mask=mask_.unsqueeze(0),
-                            class_labels=label_.unsqueeze(0),
-                        ).sample
-                    )
-
-                model_output = torch.cat(model_output, dim=0)
-            else:
-                labels = kwargs["class_labels"]
-                model_output = []
-                for label_ in labels:
-                    model_output.append(
-                        model(x_t[:1], ts, class_labels=label_.unsqueeze(0)).sample
-                    )
-
-                model_output = torch.cat(model_output, dim=0)
-
-            noise_pred_eps_cond, noise_pred_eps_uncond = (
-                model_output[:-1],
-                model_output[-1:],
-            )
-
-            if model_output.shape[1] == original_shape[1] * 2 and kwargs[
-                "variance_type"
-            ] in ["learned", "learned_range"]:
-                # get eps, variance
-                noise_pred_eps_cond, noise_pred_var_cond = noise_pred_eps_cond.split(
-                    x_t.shape[1], dim=1
-                )  # split the channels eps,var
-                noise_pred_eps_uncond, _ = noise_pred_eps_uncond.split(
-                    x_t.shape[1], dim=1
-                )
-
-            noise_pred = noise_pred_eps_uncond + args.guidance_scale * (
-                noise_pred_eps_cond - noise_pred_eps_uncond
-            ).sum(dim=0, keepdim=True)
-
-            if model_output.shape[1] == original_shape[1] * 2 and kwargs[
-                "variance_type"
-            ] in ["learned", "learned_range"]:
-                noise_pred = torch.cat([noise_pred, noise_pred_var_cond], dim=1)
-
-            # Need to scale the gradients by coefficient to properly account for normalization in DSM loss + data contraction
-            # where we have replaced ε_θ(x, t) with -σ_t * ∇_x f_θ(x + σ_t * ε)
-
-            return -1 * kwargs["scalar"] * noise_pred
-
-        def gradient_adjusted_compose(x_t, ts, model, kwargs):
-            # for classifier-free-guidance
-            original_shape = x_t.shape
-            x_t = torch.cat([x_t] * 2)
-
-            # check if key "mask" exsits in kwargs
-            if "mask" in kwargs:
-                mask = kwargs["mask"]
-                labels = kwargs["class_labels"]
-
-                model_output = []
-                energy = []
-                for label_, mask_ in zip(labels, mask):
-                    model_output_, energy_ = model(
-                        x_t[:1],
-                        ts,
-                        mask=mask_.unsqueeze(0),
-                        class_labels=label_.unsqueeze(0),
-                        return_dict=False,
-                    )
-                    model_output.append(model_output_)
-                    energy.append(energy_)
-
-                model_output = torch.cat(model_output, dim=0)
-                energy = torch.cat(energy, dim=0)
-            else:
-                labels = kwargs["class_labels"]
-
-                model_output = []
-                energy = []
-                for label_ in labels:
-                    model_output_, energy_ = model(
-                        x_t[:1], ts, class_labels=label_.unsqueeze(0), return_dict=False
-                    )
-                    model_output.append(model_output_)
-                    energy.append(energy_)
-
-                model_output = torch.cat(model_output, dim=0)
-                energy = torch.cat(energy, dim=0)
-
-            # split the output into conditional and unconditional
-            noise_pred_eps_cond, noise_pred_eps_uncond = (
-                model_output[:-1],
-                model_output[-1:],
-            )
-            energy_cond, energy_uncond = energy[:-1], energy[-1:]
-
-            total_energy = energy_uncond.sum() + args.energy_guidance_scale * (
-                energy_cond.sum() - energy_uncond.sum()
-            )
-
-            if model_output.shape[1] == original_shape[1] * 2 and kwargs[
-                "variance_type"
-            ] in ["learned", "learned_range"]:
-                # get eps, variance
-                noise_pred_eps_cond, noise_pred_var_cond = noise_pred_eps_cond.split(
-                    x_t.shape[1], dim=1
-                )  # split the channels eps,var
-                noise_pred_eps_uncond, _ = noise_pred_eps_uncond.split(
-                    x_t.shape[1], dim=1
-                )
-
-                # TODO: Better way of composing when variance present
-                # In order to add variance back to the model_output , we average the variance across all conditionals in compositions
-                noise_pred_var_cond = torch.mean(
-                    noise_pred_var_cond, dim=0, keepdim=True
-                )
-
-            noise_pred = noise_pred_eps_uncond + args.guidance_scale * (
-                noise_pred_eps_cond - noise_pred_eps_uncond
-            ).sum(dim=0, keepdim=True)
-
-            if model_output.shape[1] == original_shape[1] * 2 and kwargs[
-                "variance_type"
-            ] in ["learned", "learned_range"]:
-                noise_pred = torch.cat([noise_pred, noise_pred_var_cond], dim=1)
-
-            # Need to scale the gradients by coefficient to properly account for normalization in DSM loss + data contraction
-            # where we have replaced ε_θ(x, t) with -σ_t * ∇_x f_θ(x + σ_t * ε)
-
-            return (
-                -1 * kwargs["scalar"] * total_energy,
-                -1 * kwargs["scalar"] * noise_pred,
-            )
-
-        def gradient_adjusted(x_t, ts, model, kwargs):
-            # for classifier-free-guidance
-
-            original_shape = x_t.shape
-            x_t = torch.cat([x_t] * 2)
-
-            # check if key "mask" exsits in kwargs
-            if "mask" in kwargs:
-
-                model_output, energy = model(
-                    x_t,
-                    ts,
-                    mask=kwargs["mask"],
-                    class_labels=kwargs["class_labels"],
-                    return_dict=False,
-                )
-            else:
-                model_output, energy = model(
-                    x_t, ts, class_labels=kwargs["class_labels"], return_dict=False
-                )
-
-
-            # split the output into conditional and unconditional
-            out_size = model_output.size()  # (2*batch_size, channels, height, width)
-            pred_noise = model_output.reshape(
-                2, -1, *out_size[1:]
-            )  # (2, batch_size, channels, height, width)
-            noise_pred_eps_cond, noise_pred_eps_uncond = pred_noise[0], pred_noise[1]
-
-            # do the same for energy (This is used for Adjusted sampling)
-            energy = energy.reshape(2, -1, *energy.size()[1:])
-            energy_cond, energy_uncond = energy[0], energy[1]
-            total_energy = energy_uncond.sum() + args.guidance_scale * (
-                energy_cond.sum() - energy_uncond.sum()
-            )
-
-            if model_output.shape[1] == original_shape[1] * 2 and kwargs[
-                "variance_type"
-            ] in ["learned", "learned_range"]:
-                # get eps, variance
-                noise_pred_eps_cond, noise_pred_var_cond = noise_pred_eps_cond.split(
-                    x_t.shape[1], dim=1
-                )  # split the channels eps,var
-                noise_pred_eps_uncond, _ = noise_pred_eps_uncond.split(
-                    x_t.shape[1], dim=1
-                )
-
-            noise_pred = noise_pred_eps_uncond + args.guidance_scale * (
-                noise_pred_eps_cond - noise_pred_eps_uncond
-            )
-
-            if model_output.shape[1] == original_shape[1] * 2 and kwargs[
-                "variance_type"
-            ] in ["learned", "learned_range"]:
-                noise_pred = torch.cat([noise_pred, noise_pred_var_cond], dim=1)
-
-            # Need to scale the gradients by coefficient to properly account for normalization in DSM loss + data contraction
-            # where we have replaced ε_θ(x, t) with -σ_t * ∇_x f_θ(x + σ_t * ε)
-            return (
-                -1 * kwargs["scalar"] * total_energy,
-                -1 * kwargs["scalar"] * noise_pred,
-            )
-
-        mass_diag_sqrt = noise_scheduler.betas
-
-        if args.mcmc_sampler in ["MALA", "CHA"]:
-            if args.composition_pipeline:
-                grad_fn_ = gradient_adjusted_compose
-            else:
-                grad_fn_ = gradient_adjusted
-        else:
-            if args.composition_pipeline:
-                grad_fn_ = gradient_compose
-            else:
-                grad_fn_ = gradient
-
-        mcmc_sampler = get_mcmc_sampler(
-            sampler_name=args.mcmc_sampler,
-            grad_fn=grad_fn_,
-            step_sizes=(noise_scheduler.betas) * (args.step_sizes_multiplier),
-            num_steps=args.ddpm_num_steps,
-            num_samples_per_step=args.num_samples_per_step,  # 10 or 20
-            damping_coeff=args.damping_coeff,  # .9
-            mass_diag_sqrt=mass_diag_sqrt,
-            num_leapfrog_steps=args.num_leapfrog_steps,
-        )
+        mcmc_sampler = get_grad_fn_mcmc_sampler(args,noise_scheduler)
     else:
         mcmc_sampler = None
 
@@ -809,23 +595,41 @@ def main(args):
             ema_model.store(unet.parameters())
             ema_model.copy_to(unet.parameters())
 
-        if args.energy_based_inference:
-            if args.composition_pipeline:
+        
+        # Get the pipeline class based on the arguments
+        if args.energy_based_training:
+            if args.composition_pipeline and not args.text_conditioning:
                 pipeline_cls = Compose_DDPMPipeline
+            elif not args.composition_pipeline and args.text_conditioning:
+                pipeline_cls = Energy_Text_DDPMPipeline
+            elif args.composition_pipeline and args.text_conditioning:
+                raise ValueError( "Composition pipeline and text conditioning are not supported together")
             else:
                 pipeline_cls = Energy_DDPMPipeline
-
         else:
-            if args.composition_pipeline:
+            if args.composition_pipeline and not args.text_conditioning:
                 pipeline_cls = Compose_DDPMPipeline
+            elif not args.composition_pipeline and args.text_conditioning:
+                pipeline_cls = Custom_Text_DDPMPipeline
+            elif args.composition_pipeline and args.text_conditioning:
+                raise ValueError( "Composition pipeline and text conditioning are not supported together")
             else:
                 pipeline_cls = Custom_DDPMPipeline
 
-        pipeline = pipeline_cls(
-            unet=unet,
-            scheduler=noise_scheduler,
-            mcmc_sampler=mcmc_sampler,  
+        if args.text_conditioning:
+            pipeline = pipeline_cls(
+                unet=unet,
+                scheduler=noise_scheduler,
+                tokenizer= tokenizer ,
+                text_encoder=text_encoder,
+                mcmc_sampler=mcmc_sampler,
         )
+        else:
+            pipeline = pipeline_cls(
+                unet=unet,
+                scheduler=noise_scheduler,
+                mcmc_sampler=mcmc_sampler,  
+            )
 
         generator = torch.Generator(device=pipeline.device).manual_seed(0)
         # run pipeline in inference (sample random noise and denoise)
@@ -848,16 +652,30 @@ def main(args):
         else:
             sampled_class_labels = None
 
-        images = pipeline(
-            generator=generator,
-            batch_size=args.eval_batch_size,
-            num_inference_steps=args.ddpm_num_inference_steps,
-            output_type="np",
-            class_labels=sampled_class_labels,
-            classifier_free_guidance=args.classifier_free_guidance,
-            guidance_scale=args.guidance_scale,
-            mcmc_sampler_start_timestep=args.mcmc_sampler_start_timestep,
-        ).images
+
+        if args.text_conditioning:
+            if args.validation_prompts:
+                images = pipeline(
+                    prompt=args.validation_prompts,
+                    batch_size= args.eval_batch_size,
+                    generator=  generator,
+                    num_inference_steps=args.ddpm_num_inference_steps,
+                    output_type="np",
+                    classifier_free_guidance=args.classifier_free_guidance,
+                    guidance_scale=args.guidance_scale,
+                    mcmc_sampler_start_timestep=args.mcmc_sampler_start_timestep,
+                ).images
+        else:
+            images = pipeline(
+                generator=generator,
+                batch_size=args.eval_batch_size,
+                num_inference_steps=args.ddpm_num_inference_steps,
+                output_type="np",
+                class_labels=sampled_class_labels,
+                classifier_free_guidance=args.classifier_free_guidance,
+                guidance_scale=args.guidance_scale,
+                mcmc_sampler_start_timestep=args.mcmc_sampler_start_timestep,
+            ).images
 
         if args.use_ema:
             ema_model.restore(unet.parameters())

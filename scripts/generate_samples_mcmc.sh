@@ -23,7 +23,6 @@ python eval.py \
                 --classifier_free_guidance \
                 --project_name continual-diffusers \
                 --run_name evals_c10_score_cosine_Score_ULA \
-                --energy_based_inference \
                 --mcmc_sampler ULA \
                 --num_samples_per_step 10 \
                 --step_sizes_multiplier 0.00015 \
@@ -42,7 +41,7 @@ python eval.py \
                 --guidance_scale 5 \
                 --resolution 32 \
                 --ddpm_num_inference_steps 1000 \
-                --energy_based_inference \
+                --energy_based_training \
                 --energy_score_type dae \
                 --output_dir /cgm_logs/evals_c10_DAE_cosine \
                 --cache_dir /cgm_logs/cache \

@@ -37,28 +37,28 @@ python main.py --data_path $DATA_PATH \
 
 
 # Example Script for Multi-GPU Training with Gradient Accumulation:
-# export MASTER_PORT=$(expr 10000 + $(echo -n $SLURM_JOBID | tail -c 4))
-# export WORLD_SIZE=$((${SLURM_JOB_NUM_NODES:=1} * $SLURM_GPUS_ON_NODE))
-# export MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
+export MASTER_PORT=$(expr 10000 + $(echo -n $SLURM_JOBID | tail -c 4))
+export WORLD_SIZE=$((${SLURM_JOB_NUM_NODES:=1} * $SLURM_GPUS_ON_NODE))
+export MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
 
-# accelerate launch  --main_process_ip $MASTER_ADDR --main_process_port $MASTER_PORT  main.py --data_path $DATA_PATH_C10 \
-#                 --dataset_name mscoco \
-#                 --guidance_scale 5 \
-#                 --energy_based_training \
-#                 --energy_score_type dae \
-#                 --ddpm_beta_schedule "squaredcos_cap_v2" \
-#                 --clip_grad_norm 10 \
-#                 --ddpm_num_inference_steps 500 \
-#                 --gradient_accumulation_steps 2 \
-#                 --resolution 32 \
-#                 --num_epochs 50 \
-#                 --output_dir /cgm_logs/output_CIFAR_cfg_energy_dae_clip_10_cosine_GRAD_ACC_2 \
-#                 --cache_dir /cgm_logs/cache \
-#                 --logger wandb \
-#                 --train_batch_size 32 \
-#                 --eval_batch_size 2 \
-#                 --buffer_size 2000 \
-#                 --num_class_labels 6 \
-#                 --classifier_free_guidance \
-#                 --project_name continual-diffusers \
-#                 --run_name CFG_CIFAR_CLIP10_ENERGY_dae_2k_COSINE_GRAD_ACC_2
+accelerate launch  --main_process_ip $MASTER_ADDR --main_process_port $MASTER_PORT  main.py --data_path $DATA_PATH_C10 \
+                --dataset_name mscoco \
+                --guidance_scale 5 \
+                --energy_based_training \
+                --energy_score_type dae \
+                --ddpm_beta_schedule "squaredcos_cap_v2" \
+                --clip_grad_norm 10 \
+                --ddpm_num_inference_steps 500 \
+                --gradient_accumulation_steps 2 \
+                --resolution 32 \
+                --num_epochs 50 \
+                --output_dir /cgm_logs/output_CIFAR_cfg_energy_dae_clip_10_cosine_GRAD_ACC_2 \
+                --cache_dir /cgm_logs/cache \
+                --logger wandb \
+                --train_batch_size 32 \
+                --eval_batch_size 2 \
+                --buffer_size 2000 \
+                --num_class_labels 6 \
+                --classifier_free_guidance \
+                --project_name continual-diffusers \
+                --run_name CFG_CIFAR_CLIP10_ENERGY_dae_2k_COSINE_GRAD_ACC_2

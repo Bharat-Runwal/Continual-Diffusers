@@ -65,7 +65,7 @@ def log_validation(
 
         with autocast_ctx:
             image = pipeline(
-                args.validation_prompts[i], num_inference_steps=20, generator=generator
+                args.validation_prompts[i], num_inference_steps=args.num_inference_steps, generator=generator
             ).images[0]
 
         images.append(image)
@@ -155,7 +155,7 @@ def train_one_epoch_ldm(
         with accelerator.accumulate(unet):
             # Convert images to latent space
             latents = vae.encode(
-                batch["pixel_values"].to(weight_dtype)
+                batch["images"].to(weight_dtype)
             ).latent_dist.sample()
             latents = latents * vae.config.scaling_factor
 
@@ -211,9 +211,10 @@ def train_one_epoch_ldm(
                     timesteps,
                     noise,
                     noisy_latents,
+                    None,
                     target,
                     encoder_hidden_states,
-                    args,
+                    args
                 )
             else:
                 loss = train_step(
@@ -222,9 +223,10 @@ def train_one_epoch_ldm(
                     timesteps,
                     noise,
                     noisy_latents,
+                    None,
                     target,
                     encoder_hidden_states,
-                    args,
+                    args
                 )
             # Gather the losses across all processes for logging (if we use distributed training).
             avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()

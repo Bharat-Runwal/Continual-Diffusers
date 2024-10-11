@@ -22,22 +22,19 @@ import argparse
 import logging
 import math
 import os
-import random
 from pathlib import Path
 
 import accelerate
 import datasets
 import diffusers
-import numpy as np
 import torch
-import torch.nn.functional as F
+from torchvision import transforms
 import torch.utils.checkpoint
 import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.state import AcceleratorState
 from accelerate.utils import ProjectConfiguration, set_seed
-from datasets import load_dataset
 from diffusers import (AutoencoderKL, DDPMScheduler, StableDiffusionPipeline,
                        UNet2DConditionModel)
 from diffusers.optimization import get_scheduler
@@ -50,12 +47,10 @@ from diffusers.utils.import_utils import is_xformers_available
 from diffusers.utils.torch_utils import is_compiled_module
 from huggingface_hub import create_repo
 from packaging import version
-from torchvision import transforms
-from tqdm.auto import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer
 from transformers.utils import ContextManagers
 
-from continual_diffusers.dataset.dataset_ldm import (get_datasets,
+from continual_diffusers.dataset.dataset_ldm import (get_datasets_ldm,
                                  preprocess_and_get_hf_dataset_curr_task)
 from continual_diffusers.models.unets import Energy_Unet2DConditional
 from continual_diffusers.replay.buffer import BufferReplay
@@ -206,7 +201,7 @@ def parse_args():
     parser.add_argument(
         "--image_column",
         type=str,
-        default="image",
+        default="images",
         help="The column of the dataset containing an image.",
     )
     parser.add_argument(
@@ -533,7 +528,6 @@ def parse_args():
         type=str,
         default=None,
         help="Path to the data directory.",
-        required=True,
     )
     # Replay arguments
 
@@ -585,7 +579,9 @@ def parse_args():
         action="store_true",
         help="Whether to initialize the UNet from scratch.",
     )
-
+    parser.add_argument(
+        "--num_inference_steps", type=int, default=50, help="number of inference steps for validation prompt Generation"
+    )
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
@@ -822,10 +818,12 @@ def main():
                     weights.pop()
 
         def load_model_hook(models, input_dir):
+            model_cls_ = Energy_Unet2DConditional if args.energy_based_training else UNet2DConditionModel
+
             if args.use_ema:
                 load_model = EMAModel.from_pretrained(
                     os.path.join(input_dir, "unet_ema"),
-                    UNet2DConditionModel,
+                    model_cls_,
                     foreach=args.foreach_ema,
                 )
                 ema_unet.load_state_dict(load_model.state_dict())
@@ -840,7 +838,7 @@ def main():
                 model = models.pop()
 
                 # load diffusers style into model
-                load_model = UNet2DConditionModel.from_pretrained(
+                load_model = model_cls_.from_pretrained(
                     input_dir, subfolder="unet"
                 )
                 model.register_to_config(**load_model.config)
@@ -943,9 +941,30 @@ def main():
 
     replay = BufferReplay(args, device=accelerator.device)
 
-    data_structure, num_tasks = get_datasets(args)
-    current_task = 1
 
+    # Preprocessing the datasets.
+    transform = transforms.Compose(
+        [
+            transforms.Resize(
+                args.resolution, interpolation=transforms.InterpolationMode.BILINEAR
+            ),
+            (
+                transforms.CenterCrop(args.resolution)
+                if args.center_crop
+                else transforms.RandomCrop(args.resolution)
+            ),
+            (
+                transforms.RandomHorizontalFlip()
+                if args.random_flip
+                else transforms.Lambda(lambda x: x)
+            ),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5], [0.5]),
+        ]
+    )
+
+    data_structure, num_tasks = get_datasets_ldm(args)
+    current_task = 1
 
     if args.resume_from_checkpoint:
         # Saved checkpoint : checkpoint-{global_step_for_task}-{task_num}-{epoch}
@@ -960,23 +979,23 @@ def main():
 
         initial_global_step = global_step
 
-  
-    resume_once=False
 
+  
+    resume_once = False
     for task_num in range(current_task, num_tasks + 1):
         if resume_once:
             global_step = 0
             first_epoch = 0
             initial_global_step = 0
         else:
+
             if not args.resume_from_checkpoint:
                 global_step = 0
                 first_epoch = 0
                 initial_global_step = 0
             else:
                 resume_once = True
-
-
+        
         # Load the dataset for the current task
         if task_num == 1:
             train_dataset = preprocess_and_get_hf_dataset_curr_task(
@@ -988,6 +1007,7 @@ def main():
                 args.caption_column,
                 args.image_column,
                 replay=None,        # No replay for the first task
+                train_transform = transform
             )
         else:
             train_dataset = preprocess_and_get_hf_dataset_curr_task(
@@ -999,17 +1019,18 @@ def main():
                 args.caption_column,
                 args.image_column,
                 replay=replay,
+                train_transform=transform
             )
 
         def collate_fn(examples):
             pixel_values = torch.stack(
-                [example["pixel_values"] for example in examples]
+                [example["images"] for example in examples]
             )
             pixel_values = pixel_values.to(
                 memory_format=torch.contiguous_format
             ).float()
             input_ids = torch.stack([example["input_ids"] for example in examples])
-            return {"pixel_values": pixel_values, "input_ids": input_ids}
+            return {"images": pixel_values, "input_ids": input_ids}
 
         # DataLoaders creation:
         train_dataloader = torch.utils.data.DataLoader(
@@ -1092,7 +1113,8 @@ def main():
             f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}"
         )
         logger.info(f"  Total optimization steps = {args.max_train_steps}")
-
+        
+        
         logger.info(
             f" Starting with : Task: {task_num} ,first_epoch: {first_epoch}, global_step: {global_step}"
         )

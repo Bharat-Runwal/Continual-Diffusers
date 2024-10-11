@@ -3,11 +3,10 @@ import pickle
 import random
 
 import numpy as np
-import torch as th
-from datasets import Dataset
+from datasets import Dataset as Dataset_hf
 from PIL import Image
-from torch.utils.data import Dataset
 from torchvision import transforms
+
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -21,10 +20,10 @@ def convert_task_to_dataset(task):
     Args:
         task: dictionary containing images, labels
     """
-    return Dataset.from_dict(task)
+    return Dataset_hf.from_dict(task)
 
 
-def get_datasets(args):
+def get_datasets_ldm(args):
     """
     Initialize the dataset based on the provided arguments and return the dataset instance and total number of tasks.
 
@@ -44,23 +43,42 @@ def get_datasets(args):
             total_tasks = len(data_structure)
 
             logger.info(f"Dataset successfully loaded with {total_tasks} tasks.")
+            
             return data_structure, total_tasks
         else:
-            logger.error("Data structure not found in the file.")
-            return None, 0
-    except FileNotFoundError:
-        logger.error(f"File not found: {args.data_path}")
-        return None, 0
-    except KeyError:
-        logger.error("Error in data structure keys.")
-        return None, 0
+            raise KeyError("Key 'data_structure' not found in the file.")
+
     except Exception as e:
-        logger.error(f"An unexpected error occurred: {e}")
-        return None, 0
+        raise Exception(f"An unexpected error occurred: {e}")
 
 
-def preprocess(tokenizer, args, accelerator, dataset, caption_column, image_column):
+
+def get_tokenized_text(captions, tokenizer):
+    """
+    Tokenize the input text using the provided tokenizer
+    """
+    inputs = tokenizer(
+        captions,
+        max_length=tokenizer.model_max_length,
+        padding="max_length",
+        truncation=True,
+        return_tensors="pt",
+    )
+    return inputs
+
+
+def preprocess(tokenizer, args, accelerator, dataset, caption_column, image_column,train_transforms):
     # Preprocessing the datasets.
+    if train_transforms is None:
+        train_transforms = transforms.Compose(
+            [
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+            ]
+        )
+        
+        logger.info(f"Using default training transforms: {train_transforms}")
+
     # We need to tokenize input captions and transform the images.
     def tokenize_captions(examples, is_train=True):
         captions = []
@@ -74,42 +92,17 @@ def preprocess(tokenizer, args, accelerator, dataset, caption_column, image_colu
                 raise ValueError(
                     f"Caption column `{caption_column}` should contain either strings or lists of strings."
                 )
-        inputs = tokenizer(
-            captions,
-            max_length=tokenizer.model_max_length,
-            padding="max_length",
-            truncation=True,
-            return_tensors="pt",
-        )
+
+        inputs = get_tokenized_text(captions, tokenizer) 
         return inputs.input_ids
 
-    # Preprocessing the datasets.
-    train_transforms = transforms.Compose(
-        [
-            transforms.Resize(
-                args.resolution, interpolation=transforms.InterpolationMode.BILINEAR
-            ),
-            (
-                transforms.CenterCrop(args.resolution)
-                if args.center_crop
-                else transforms.RandomCrop(args.resolution)
-            ),
-            (
-                transforms.RandomHorizontalFlip()
-                if args.random_flip
-                else transforms.Lambda(lambda x: x)
-            ),
-            transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5]),
-        ]
-    )
 
     def preprocess_train(examples):
         images = [
             Image.fromarray(np.array(image, dtype=np.uint8)).convert("RGB")
             for image in examples[image_column]
         ]
-        examples["pixel_values"] = [train_transforms(image) for image in images]
+        examples["images"] = [train_transforms(image) for image in images]
         examples["input_ids"] = tokenize_captions(examples)
         return examples
 
@@ -133,6 +126,7 @@ def preprocess_and_get_hf_dataset_curr_task(
     caption_column,
     image_column,
     replay=None,
+    train_transform=None,
 ):
     """
     Get the dataset for the current task
@@ -146,6 +140,7 @@ def preprocess_and_get_hf_dataset_curr_task(
         caption_column: The column containing captions
         image_column: The column containing images
         replay: Optional replay buffer
+        train_transform: The transforms to be applied to the training images
 
     Returns:
         dataset: Dataset class object
@@ -158,19 +153,9 @@ def preprocess_and_get_hf_dataset_curr_task(
 
         dataset = convert_task_to_dataset(combined_data)
         dataset = preprocess(
-            tokenizer, args, accelerator, dataset, caption_column, image_column
+            tokenizer, args, accelerator, dataset, caption_column, image_column,train_transform
         )
-    except:
-        logger.error(
-            f"Error in getting dataset for current task: {task_id} not in data_structure"
-        )
-        return None
+    except Exception as e:
+        raise Exception(f"An unexpected error occurred: {e}")
+    
     return dataset
-
-
-# TEST
-# data_structure = {
-#     1: {'images':  np.random.randint(0, 256, size=(100, 32, 32, 3), dtype=np.uint8), 'labels': np.random.randint(0, 5, 100)},
-#     2: {'images':  np.random.randint(0, 256, size=(100, 32, 32, 3), dtype=np.uint8),'labels': np.random.randint(5, 10, 100)}  # Example state with no labels provided
-# }
-
