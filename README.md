@@ -19,9 +19,8 @@ A pytorch library for continual learning with diffusion models. This library is 
 - **Evaluation**: Supports multiple evaluation types such as ancestral sampling, MCMC sampling, and compositional generation.
 - **Training**: Includes support for Multi-GPU training, gradient accumulation, and other performance optimizations provided by the Diffusers library.
 
-Comming Soon:
+Coming Soon:
 - **LoRA**: Support for LoRA finetuning with Latent Diffusion Models.
-- **Slot Attention**: Conditioning with a slot attention module for training diffusion models.
 ---
 
 ## Setting up the environment
